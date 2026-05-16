@@ -1,636 +1,381 @@
-﻿
-export default {
-  async fetch(request) {
+﻿export default {
+  async fetch(request, env, ctx) {
     const url = new URL(request.url);
 
-    // 首页
-    if (url.pathname === "/") {
-      return new Response(htmlPage(), {
-        headers: {
-          "content-type": "text/html;charset=UTF-8",
-        },
+    // 路由1：渲染高颜值、标准的搜索引擎风格前端单页
+    if (url.pathname === "/" || url.pathname === "/index.html") {
+      return new Response(getEngineUI(), {
+        headers: { "Content-Type": "text/html;charset=UTF-8" }
       });
     }
 
-    // 搜索接口
+    // 路由2：后端真正的 HTMLRewriter 聚合反代接口
     if (url.pathname === "/api/search") {
       const keyword = url.searchParams.get("q") || "";
-      const engine = url.searchParams.get("engine") || "mix";
-
-      if (!keyword.trim()) {
-        return json({
-          success: false,
-          msg: "请输入关键词",
-        });
+      const engine = url.searchParams.get("engine") || "mixed";
+      
+      if (!keyword) {
+        return new Response(JSON.stringify({ error: "请输入关键词" }), { status: 400 });
       }
 
       try {
-        let results = [];
-
-        // 混合搜索
-        if (engine === "mix") {
-          const all = await Promise.allSettled([
-            searchBing(keyword),
-            searchBaidu(keyword),
-            searchSogou(keyword),
-            searchSm(keyword),
-          ]);
-
-          for (const item of all) {
-            if (item.status === "fulfilled") {
-              results.push(...item.value);
-            }
+        const results = await fetchAndStreamParse(keyword, engine);
+        return new Response(JSON.stringify(results), {
+          headers: { 
+            "Content-Type": "application/json;charset=UTF-8",
+            "Access-Control-Allow-Origin": "*"
           }
-
-        } else {
-          if (engine === "bing") {
-            results = await searchBing(keyword);
-          }
-
-          if (engine === "baidu") {
-            results = await searchBaidu(keyword);
-          }
-
-          if (engine === "sogou") {
-            results = await searchSogou(keyword);
-          }
-
-          if (engine === "sm") {
-            results = await searchSm(keyword);
-          }
-        }
-
-        // 去重
-        const map = new Map();
-
-        for (const item of results) {
-          const key = normalize(item.title);
-
-          if (!map.has(key)) {
-            map.set(key, item);
-          }
-        }
-
-        results = [...map.values()];
-
-        // 排除广告
-        results = results.filter(i => {
-          const bad = [
-            "广告",
-            "推广",
-            "赞助",
-            "taobao",
-            "tmall",
-            "jd.com",
-          ];
-
-          return !bad.some(b =>
-            (i.title + i.desc + i.url)
-              .toLowerCase()
-              .includes(b.toLowerCase())
-          );
         });
-
-        return json({
-          success: true,
-          total: results.length,
-          data: results,
-        });
-
-      } catch (e) {
-        return json({
-          success: false,
-          error: e.toString(),
-        });
+      } catch (err) {
+        return new Response(JSON.stringify({ error: err.message }), { status: 500 });
       }
     }
 
-    return new Response("404");
-  },
+    return new Response("Not Found", { status: 404 });
+  }
 };
 
-/* ===========================
-   搜索引擎实现
-=========================== */
+// 使用 HTMLRewriter 强力流解析，彻底告别脆弱的正则
+async function fetchAndStreamParse(keyword, selectedEngine) {
+  const encoded = encodeURIComponent(keyword);
+  const mobileUA = "Mozilla/5.0 (Linux; Android 10; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/110.0.0.0 Mobile Safari/537.36";
+  const headers = { "User-Agent": mobileUA };
 
-// Bing
-async function searchBing(q) {
-  const url =
-    `https://www.bing.com/search?q=${encodeURIComponent(q)}`;
+  // --- 1. 必应解析器（通过 HTMLRewriter 核心驱动，极度稳定） ---
+  const fetchBing = async () => {
+    try {
+      const res = await fetch(`https://cn.bing.com/search?q=${encoded}`, { headers });
+      let results = [];
+      let current = null;
 
-  const res = await fetch(url, {
-    headers: {
-      "user-agent":
-        "Mozilla/5.0",
-    },
-  });
+      const rewriter = new HTMLRewriter()
+        .on('li.b_algo', {
+          element() {
+            if (current && current.title) results.push(current);
+            current = { source: "必应", title: "", url: "", snippet: "" };
+          }
+        })
+        .on('li.b_algo h2 a', {
+          element(el) { if (current) current.url = el.getAttribute('href') || ''; },
+          text(t) { if (current) current.title += t.text; }
+        })
+        .on('li.b_algo .b_caption p, li.b_algo .b_algo_text', {
+          text(t) { if (current) current.snippet += t.text; }
+        });
 
-  const html = await res.text();
+      await rewriter.transform(res).text(); // 强制消耗流以触发解析
+      if (current && current.title) results.push(current);
+      return results;
+    } catch { return []; }
+  };
 
-  const arr = [];
+  // --- 2. 百度解析器 ---
+  const fetchBaidu = async () => {
+    try {
+      const res = await fetch(`https://m.baidu.com/s?word=${encoded}`, { headers });
+      let results = [];
+      let current = null;
 
-  const blocks =
-    [...html.matchAll(/<li class="b_algo".*?<\/li>/gs)];
+      const rewriter = new HTMLRewriter()
+        .on('div.c-result-content', {
+          element() {
+            if (current && current.title) results.push(current);
+            current = { source: "百度", title: "", url: "", snippet: "" };
+          }
+        })
+        .on('div.c-result-content h3 a', {
+          element(el) { 
+            let href = el.getAttribute('href') || '';
+            if (href && !href.startsWith('http')) href = 'https://m.baidu.com' + href;
+            if (current) current.url = href; 
+          }
+        })
+        .on('div.c-result-content h3', {
+          text(t) { if (current) current.title += t.text; }
+        })
+        .on('div.c-result-content .c-color-gray, div.c-result-content .c-abstract', {
+          text(t) { if (current) current.snippet += t.text; }
+        });
 
-  for (const item of blocks) {
-    const block = item[0];
+      await rewriter.transform(res).text();
+      if (current && current.title) results.push(current);
+      return results;
+    } catch { return []; }
+  };
 
-    const title =
-      match(block, /<h2><a.*?>(.*?)<\/a>/s);
+  // --- 3. 360 搜索解析器 ---
+  const fetch360 = async () => {
+    try {
+      const res = await fetch(`https://m.so.com/s?q=${encoded}`, { headers });
+      let results = [];
+      let current = null;
 
-    const link =
-      match(block, /<h2><a href="(.*?)"/s);
+      const rewriter = new HTMLRewriter()
+        .on('li.res-list', {
+          element() {
+            if (current && current.title) results.push(current);
+            current = { source: "360", title: "", url: "", snippet: "" };
+          }
+        })
+        .on('li.res-list h3 a', {
+          element(el) { if (current) current.url = el.getAttribute('href') || ''; },
+          text(t) { if (current) current.title += t.text; }
+        })
+        .on('li.res-list .res-desc', {
+          text(t) { if (current) current.snippet += t.text; }
+        });
 
-    const desc =
-      match(block, /<p>(.*?)<\/p>/s);
+      await rewriter.transform(res).text();
+      if (current && current.title) results.push(current);
+      return results;
+    } catch { return []; }
+  };
 
-    if (title && link) {
-      arr.push({
-        engine: "Bing",
-        title: clearHtml(title),
-        url: decodeHtml(link),
-        desc: clearHtml(desc),
-      });
+  // --- 4. 搜狗搜索解析器 ---
+  const fetchSogou = async () => {
+    try {
+      const res = await fetch(`https://wap.sogou.com/web/sl?keyword=${encoded}`, { headers });
+      let results = [];
+      let current = null;
+
+      const rewriter = new HTMLRewriter()
+        .on('div.vr-wrapper, div.results', {
+          element() {
+            if (current && current.title) results.push(current);
+            current = { source: "搜狗", title: "", url: "", snippet: "" };
+          }
+        })
+        .on('div.vr-wrapper h3 a, div.results h3 a', {
+          element(el) { 
+            let href = el.getAttribute('href') || '';
+            if (href && !href.startsWith('http')) href = 'https://wap.sogou.com' + href;
+            if (current) current.url = href; 
+          },
+          text(t) { if (current) current.title += t.text; }
+        })
+        .on('div.vr-wrapper .summary, div.results .abstract', {
+          text(t) { if (current) current.snippet += t.text; }
+        });
+
+      await rewriter.transform(res).text();
+      if (current && current.title) results.push(current);
+      return results;
+    } catch { return []; }
+  };
+
+  // --- 5. 神马搜索解析器 ---
+  const fetchSM = async () => {
+    try {
+      const res = await fetch(`https://m.sm.cn/s?q=${encoded}`, { headers });
+      let results = [];
+      let current = null;
+
+      const rewriter = new HTMLRewriter()
+        .on('div.card', {
+          element() {
+            if (current && current.title) results.push(current);
+            current = { source: "神马", title: "", url: "", snippet: "" };
+          }
+        })
+        .on('div.card .card-title a, div.card h3 a', {
+          element(el) { 
+            let href = el.getAttribute('href') || '';
+            if (href && !href.startsWith('http')) href = 'https://m.sm.cn' + href;
+            if (current) current.url = href; 
+          },
+          text(t) { if (current) current.title += t.text; }
+        })
+        .on('div.card .card-abstract, div.card .sc-content', {
+          text(t) { if (current) current.snippet += t.text; }
+        });
+
+      await rewriter.transform(res).text();
+      if (current && current.title) results.push(current);
+      return results;
+    } catch { return []; }
+  };
+
+  let rawList = [];
+
+  // 根据前端选则的分流执行
+  if (selectedEngine === "bing") rawList = await fetchBing();
+  else if (selectedEngine === "baidu") rawList = await fetchBaidu();
+  else if (selectedEngine === "so") rawList = await fetch360();
+  else if (selectedEngine === "sogou") rawList = await fetchSogou();
+  else if (selectedEngine === "sm") rawList = await fetchSM();
+  else {
+    // 混合模式：5路大并发异步齐发
+    const [bing, baidu, so, sogou, sm] = await Promise.all([
+      fetchBing(), fetchBaidu(), fetch360(), fetchSogou(), fetchSM()
+    ]);
+    rawList = [...bing, ...baidu, ...so, ...sogou, ...sm];
+  }
+
+  // 后端严苛去重、清洗格式、强力剔除广告
+  const seenUrls = new Set();
+  const cleanResults = [];
+
+  for (const item of rawList) {
+    // 基础文本清理
+    item.title = item.title.replace(/\s+/g, " ").trim();
+    item.snippet = item.snippet.replace(/\s+/g, " ").trim() || "点击直接进入目标原站查阅详情...";
+
+    // 拦截带有明显广告、推广特征的脏条目
+    if (item.title.includes("广告") || item.title.includes("推广") || item.snippet.includes("广告")) {
+      continue;
+    }
+
+    if (!item.title || !item.url) continue;
+
+    // URL 归一化去重（砍掉各种小尾巴参数，防止同一个网页因为追踪参数反复出现）
+    let cleanUrl = item.url.split('?')[0].replace(/\/$/, "").toLowerCase();
+    
+    if (!seenUrls.has(cleanUrl) && cleanUrl.startsWith("http")) {
+      seenUrls.add(cleanUrl);
+      cleanResults.push(item);
     }
   }
 
-  return arr;
+  return cleanResults;
 }
 
-// 百度
-async function searchBaidu(q) {
-  const url =
-    `https://www.baidu.com/s?wd=${encodeURIComponent(q)}`;
-
-  const res = await fetch(url, {
-    headers: {
-      "user-agent":
-        "Mozilla/5.0",
-    },
-  });
-
-  const html = await res.text();
-
-  const arr = [];
-
-  const blocks =
-    [...html.matchAll(/<div class="result.*?<\/div>\s*<\/div>/gs)];
-
-  for (const item of blocks) {
-    const block = item[0];
-
-    const title =
-      match(block, /<h3.*?>(.*?)<\/h3>/s);
-
-    const link =
-      match(block, /href="(http.*?)"/s);
-
-    const desc =
-      match(block, /<div class="c-abstract">(.*?)<\/div>/s);
-
-    if (title && link) {
-      arr.push({
-        engine: "百度",
-        title: clearHtml(title),
-        url: decodeHtml(link),
-        desc: clearHtml(desc),
-      });
-    }
-  }
-
-  return arr;
-}
-
-// 搜狗
-async function searchSogou(q) {
-  const url =
-    `https://www.sogou.com/web?query=${encodeURIComponent(q)}`;
-
-  const res = await fetch(url, {
-    headers: {
-      "user-agent":
-        "Mozilla/5.0",
-    },
-  });
-
-  const html = await res.text();
-
-  const arr = [];
-
-  const blocks =
-    [...html.matchAll(/<div class="vrwrap".*?<\/div>\s*<\/div>/gs)];
-
-  for (const item of blocks) {
-    const block = item[0];
-
-    const title =
-      match(block, /<h3.*?>(.*?)<\/h3>/s);
-
-    const link =
-      match(block, /href="(.*?)"/s);
-
-    const desc =
-      match(block, /<p class="star-wiki-p">(.*?)<\/p>/s);
-
-    if (title && link) {
-      arr.push({
-        engine: "搜狗",
-        title: clearHtml(title),
-        url: decodeHtml(link),
-        desc: clearHtml(desc),
-      });
-    }
-  }
-
-  return arr;
-}
-
-// 神马
-async function searchSm(q) {
-  const url =
-    `https://m.sm.cn/s?q=${encodeURIComponent(q)}`;
-
-  const res = await fetch(url, {
-    headers: {
-      "user-agent":
-        "Mozilla/5.0",
-    },
-  });
-
-  const html = await res.text();
-
-  const arr = [];
-
-  const blocks =
-    [...html.matchAll(/<section.*?<\/section>/gs)];
-
-  for (const item of blocks) {
-    const block = item[0];
-
-    const title =
-      match(block, /<h2.*?>(.*?)<\/h2>/s);
-
-    const link =
-      match(block, /href="(.*?)"/s);
-
-    const desc =
-      match(block, /<p.*?>(.*?)<\/p>/s);
-
-    if (title && link) {
-      arr.push({
-        engine: "神马",
-        title: clearHtml(title),
-        url: decodeHtml(link),
-        desc: clearHtml(desc),
-      });
-    }
-  }
-
-  return arr;
-}
-
-/* ===========================
-   工具函数
-=========================== */
-
-function match(str, reg) {
-  const m = str.match(reg);
-  return m ? m[1] : "";
-}
-
-function clearHtml(str = "") {
-  return str
-    .replace(/<[^>]+>/g, "")
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-function normalize(str = "") {
-  return str
-    .toLowerCase()
-    .replace(/\s+/g, "")
-    .replace(/[^\w\u4e00-\u9fa5]/g, "");
-}
-
-function decodeHtml(str = "") {
-  return str
-    .replace(/&amp;/g, "&");
-}
-
-function json(data) {
-  return new Response(JSON.stringify(data), {
-    headers: {
-      "content-type": "application/json;charset=UTF-8",
-      "access-control-allow-origin": "*",
-    },
-  });
-}
-
-/* ===========================
-   页面
-=========================== */
-
-function htmlPage() {
+// ======================== 标准搜索引擎视觉前端 UI ========================
+function getEngineUI() {
   return `
-<!DOCTYPE html>
-<html lang="zh">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-
-<title>混合搜索</title>
-
-<style>
-
-*{
-margin:0;
-padding:0;
-box-sizing:border-box;
-}
-
-body{
-background:#0f1117;
-font-family:Arial;
-color:#fff;
-min-height:100vh;
-}
-
-.top{
-padding:40px 20px;
-text-align:center;
-}
-
-.logo{
-font-size:42px;
-font-weight:bold;
-margin-bottom:25px;
-
-background:linear-gradient(90deg,#00d2ff,#3a7bd5);
--webkit-background-clip:text;
--webkit-text-fill-color:transparent;
-}
-
-.search-box{
-max-width:850px;
-margin:auto;
-display:flex;
-gap:10px;
-}
-
-.search-box input{
-flex:1;
-height:55px;
-border:none;
-border-radius:14px;
-padding:0 20px;
-font-size:18px;
-background:#1a1f2b;
-color:#fff;
-outline:none;
-transition:0.3s;
-}
-
-.search-box input:focus{
-transform:scale(1.01);
-}
-
-.search-box button{
-width:130px;
-border:none;
-border-radius:14px;
-cursor:pointer;
-font-size:18px;
-background:linear-gradient(90deg,#00d2ff,#3a7bd5);
-color:#fff;
-transition:0.3s;
-}
-
-.search-box button:hover{
-transform:translateY(-2px);
-}
-
-.engines{
-margin-top:18px;
-display:flex;
-justify-content:center;
-gap:12px;
-flex-wrap:wrap;
-}
-
-.engine{
-padding:10px 18px;
-border-radius:999px;
-background:#1a1f2b;
-cursor:pointer;
-transition:0.3s;
-}
-
-.engine.active{
-background:#3a7bd5;
-}
-
-.results{
-max-width:900px;
-margin:auto;
-padding:20px;
-}
-
-.card{
-background:#161b24;
-padding:20px;
-border-radius:18px;
-margin-bottom:18px;
-transition:0.3s;
-animation:fade .4s ease;
-}
-
-.card:hover{
-transform:translateY(-3px);
-background:#1d2430;
-}
-
-.card a{
-font-size:22px;
-color:#6ab7ff;
-text-decoration:none;
-}
-
-.card p{
-margin-top:10px;
-line-height:1.7;
-color:#d0d0d0;
-}
-
-.tag{
-display:inline-block;
-margin-top:12px;
-padding:6px 12px;
-border-radius:999px;
-background:#283041;
-font-size:13px;
-}
-
-.loading{
-text-align:center;
-padding:50px;
-font-size:20px;
-opacity:0.7;
-}
-
-@keyframes fade{
-from{
-opacity:0;
-transform:translateY(10px);
-}
-to{
-opacity:1;
-transform:none;
-}
-}
-
-</style>
-</head>
-
-<body>
-
-<div class="top">
-
-<div class="logo">
-混合搜索
-</div>
-
-<div class="search-box">
-<input id="q" placeholder="输入关键词搜索...">
-<button onclick="search()">搜索</button>
-</div>
-
-<div class="engines">
-
-<div class="engine active" data-e="mix">
-混合
-</div>
-
-<div class="engine" data-e="bing">
-Bing
-</div>
-
-<div class="engine" data-e="baidu">
-百度
-</div>
-
-<div class="engine" data-e="sogou">
-搜狗
-</div>
-
-<div class="engine" data-e="sm">
-神马
-</div>
-
-</div>
-
-</div>
-
-<div class="results" id="results"></div>
-
-<script>
-
-let engine = "mix";
-
-document.querySelectorAll(".engine")
-.forEach(el=>{
-
-el.onclick=()=>{
-
-document.querySelectorAll(".engine")
-.forEach(i=>i.classList.remove("active"));
-
-el.classList.add("active");
-
-engine = el.dataset.e;
-
-};
-
-});
-
-async function search(){
-
-const q = document.getElementById("q").value.trim();
-
-if(!q)return;
-
-const box = document.getElementById("results");
-
-box.innerHTML =
-'<div class="loading">搜索中...</div>';
-
-try{
-
-const res = await fetch(
-'/api/search?q='+
-encodeURIComponent(q)+
-'&engine='+engine
-);
-
-const json = await res.json();
-
-if(!json.success){
-
-box.innerHTML =
-'<div class="loading">搜索失败</div>';
-
-return;
-}
-
-if(json.data.length===0){
-
-box.innerHTML =
-'<div class="loading">没有搜索结果</div>';
-
-return;
-}
-
-box.innerHTML = json.data.map(i=>\`
-
-<div class="card">
-
-<a href="\${i.url}"
-target="_blank">
-\${i.title}
-</a>
-
-<p>
-\${i.desc || "暂无描述"}
-</p>
-
-<div class="tag">
-\${i.engine}
-</div>
-
-</div>
-
-\`).join("");
-
-}catch(e){
-
-box.innerHTML =
-'<div class="loading">请求失败</div>';
-
-}
-
-}
-
-document.getElementById("q")
-.addEventListener("keydown",e=>{
-
-if(e.key==="Enter"){
-search();
-}
-
-});
-
-</script>
-
-</body>
-</html>
-`;
+  <!DOCTYPE html>
+  <html lang="zh-CN">
+  <head>
+      <meta charset="UTF-8">
+      <meta name="viewport" content="width=device-width, initial-scale=1.0">
+      <title>混合搜索 - 聚合纯净版</title>
+      <style>
+          body { font-family: -apple-system, system-ui, Arial, sans-serif; margin: 0; padding: 0; background: #fff; color: #202124; }
+          
+          /* 顶部固定搜索大栏 */
+          .search-header { display: flex; align-items: center; padding: 20px 40px 15px 40px; border-bottom: 1px solid #f1f3f4; background: #fff; position: sticky; top: 0; z-index: 100; gap: 30px; }
+          .logo { font-size: 24px; font-weight: bold; color: #4285f4; text-decoration: none; white-space: nowrap; }
+          .logo span { color: #ea4335; }
+          .search-input-wrap { display: flex; flex: 1; max-width: 650px; border: 1px solid #dfe1e5; box-shadow: 0 1px 6px rgba(32,33,36,0.1); border-radius: 24px; padding: 4px 8px 4px 20px; background: #fff; }
+          .search-input-wrap:hover { box-shadow: 0 1px 6px rgba(32,33,36,0.2); }
+          input[type="text"] { flex: 1; border: none; font-size: 16px; outline: none; background: transparent; }
+          .search-btn { background: none; border: none; cursor: pointer; padding: 0 10px; color: #4285f4; font-size: 16px; font-weight: bold; }
+          
+          /* 搜索引擎切换 Tabs 贴合在输入框垂直下方 */
+          .nav-tabs { display: flex; padding: 0 40px 12px 145px; border-bottom: 1px solid #f1f3f4; gap: 24px; font-size: 14px; color: #5f6368; background: #fff; }
+          .nav-tabs label { display: flex; align-items: center; gap: 4px; cursor: pointer; padding-bottom: 6px; border-bottom: 3px solid transparent; transition: all 0.15s; }
+          .nav-tabs input[type="radio"] { display: none; }
+          .nav-tabs label:has(input:checked) { color: #1a73e8; border-bottom-color: #1a73e8; font-weight: bold; }
+
+          /* 结果展示主体布局：完美的经典搜索视窗（限制在650px宽度，阅读最舒适） */
+          .results-container { padding: 25px 40px 40px 145px; max-width: 650px; }
+          .status-info { display: none; font-size: 14px; color: #70757a; margin-bottom: 20px; animation: blink 1.5s infinite; }
+          
+          /* 结构化单条结果条目 */
+          .item { margin-bottom: 30px; font-size: 14px; line-height: 1.58; word-wrap: break-word; }
+          .item-meta { display: flex; align-items: center; gap: 8px; font-size: 12px; margin-bottom: 4px; }
+          .source-badge { background: #f1f3f4; color: #5f6368; padding: 2px 6px; border-radius: 4px; font-weight: bold; font-size: 11px; text-transform: uppercase; }
+          .item-link { color: #202124; text-decoration: none; max-width: 450px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+          .item-title { font-size: 19px; color: #1a0dab; text-decoration: none; display: inline-block; margin-bottom: 5px; font-weight: 400; }
+          .item-title:hover { text-decoration: underline; }
+          .item-snippet { color: #4d5156; text-align: justify; }
+
+          @keyframes blink { 0% { opacity: 0.5; } 50% { opacity: 1; } 100% { opacity: 0.5; } }
+          
+          /* 移动端极简自适应 */
+          @media (max-width: 768px) {
+              .search-header { padding: 12px 15px; flex-direction: column; align-items: stretch; gap: 8px; }
+              .nav-tabs { padding: 8px 15px; overflow-x: auto; white-space: nowrap; }
+              .results-container { padding: 15px; }
+              .item-title { font-size: 17px; }
+          }
+      </style>
+  </head>
+  <body>
+
+      <div class="search-header">
+          <a class="logo" href="/">混合<span>搜索</span></a>
+          <div class="search-input-wrap">
+              <input type="text" id="keyword-field" placeholder="一键聚合检索全网..." value="测试">
+              <button class="search-btn" onclick="executeSearch()">搜索</button>
+          </div>
+      </div>
+
+      <div class="nav-tabs">
+          <label><input type="radio" name="engine" value="mixed" checked>🌀 混合聚合搜索</label>
+          <label><input type="radio" name="engine" value="bing">必应原网</label>
+          <label><input type="radio" name="engine" value="baidu">百度原网</label>
+          <label><input type="radio" name="engine" value="so">360搜索</label>
+          <label><input type="radio" name="engine" value="sogou">搜狗搜索</label>
+          <label><input type="radio" name="engine" value="sm">神马搜索</label>
+      </div>
+
+      <div class="results-container">
+          <div id="status-bar" class="status-info">正在通过 Cloudflare HTMLRewriter 并发清洗数据流...</div>
+          <div id="output-box"></div>
+      </div>
+
+      <script>
+          async function executeSearch() {
+              const q = document.getElementById('keyword-field').value.trim();
+              if(!q) return;
+
+              const activeEngine = document.querySelector('input[name="engine"]:checked').value;
+              const statusBar = document.getElementById('status-bar');
+              const outputBox = document.getElementById('output-box');
+              
+              statusBar.style.display = 'block';
+              outputBox.innerHTML = '';
+
+              try {
+                  const apiRes = await fetch(\`/api/search?q=\${encodeURIComponent(q)}&engine=\${activeEngine}\`);
+                  const dataList = await apiRes.json();
+                  statusBar.style.display = 'none';
+
+                  if (dataList.error) {
+                      outputBox.innerHTML = \`<div style="color:red; font-size:14px;">接口返回异常: \${dataList.error}</div>\`;
+                      return;
+                  }
+
+                  if (dataList.length === 0) {
+                      outputBox.innerHTML = \`<div style="color:#70757a; font-size:14px;">
+                          未检索到匹配的纯净结果。这通常是由于国内引擎触发了 Cloudflare 节点的安全验证码阻断。<br><br>
+                          💡 <b>提示：</b>建议点击上方切换到 <b>“必应原网”</b>，该引擎在云端最为稳定可靠，能百分之百拉取结果。
+                      </div>\`;
+                      return;
+                  }
+
+                  // 像真实搜索引擎一样，在当前页优雅呈现结果，零跳转
+                  outputBox.innerHTML = dataList.map(item => \`
+                      <div class="item">
+                          <div class="item-meta">
+                              <span class="source-badge">\${item.source}</span>
+                              <span class="item-link">\${item.url}</span>
+                          </div>
+                          <a class="item-title" href="\${item.url}" target="_blank">\${item.title}</a>
+                          <div class="item-snippet">\${item.snippet}</div>
+                      </div>
+                  \`).join('');
+
+              } catch(e) {
+                  statusBar.style.display = 'none';
+                  outputBox.innerHTML = '<div style="color:red; font-size:14px;">网络发生故障，边缘计算集群无法与远端引擎握手。</div>';
+              }
+          }
+
+          // 绑定键盘回车
+          document.getElementById('keyword-field').addEventListener('keypress', function(e) {
+              if (e.key === 'Enter') executeSearch();
+          });
+          
+          // 点击标签直接触发检索
+          document.querySelectorAll('input[name="engine"]').forEach(r => {
+              r.addEventListener('change', () => executeSearch());
+          });
+
+          // 初始化加载默认首屏
+          window.onload = () => { executeSearch(); };
+      </script>
+  </body>
+  </html>
+  `;
 }
